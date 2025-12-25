@@ -1,0 +1,5 @@
+# Ignore videos
+*.mp4
+
+# Ignore extracted frames and images
+*.png
