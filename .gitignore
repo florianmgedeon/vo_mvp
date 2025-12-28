@@ -3,6 +3,7 @@
 
 # Ignore extracted frames and images
 *.png
+*.json
 
 # Ignore model output file:
 vo_mvp

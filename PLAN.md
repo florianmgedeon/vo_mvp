@@ -1,9 +1,20 @@
 Plan: Essential-Matrix & Pose-Rekonstruktion
+
 Kurz: Füge Kameraintrinsics in Config, erweitere Matching zum Persistieren (Keypoints+Matches), und implementiere stage_recover_pose in main.cpp, das für jedes Frame‑Paar K baut, findEssentialMat per RANSAC aufruft, mit recoverPose R,t gewinnt, Inlier per mask filtert und Posen validiert/speichert (für spätere BA). Ziel: robuste relative Posen für die meisten Paare.
 
 Steps
+
+
+DONE: 
+
 Config erweitern: Ergänze config.hpp um fx, fy, cx, cy und optionale Parameter ransac_thresh, ransac_prob, min_inliers. (Symbole: fx, fy, cx, cy, ransac_thresh, ransac_prob, min_inliers.)
+
 Matches persistieren: Erweiterung von stage_orb_matching in main.cpp: zusätzlich zu PNG-Visuals speichere pro Paar eine kleine JSON/YAML mit Keypoint‑Positionen und Match‑Indizes (z.B. matches/match_00000.json). Vorteil: deterministisch, debugbar, keine Rekombination nötig.
+
+
+
+
+NOT DONE:
 
 Pro Paar Ablauf (in stage_recover_pose):
 Lade Graustufenbilder aus cfg.framesDir (wie in Stage 2).
@@ -24,4 +35,3 @@ K‑Quelle: Verwende echte Kalibrierung (Option A). Heuristik (f ≈ max(w,h)) n
 Persistenz‑Format: JSON mit Feldern: keypoints1 (array of [x,y]), keypoints2, matches ([idx1, idx2]), R, t, inliers_mask, num_inliers, cheirality_ratio. Leicht lesbar und portable.
 Parameterempfehlungen: ransac_prob=0.999, ransac_thresh=1.0 (kalibriert) — falls verrauscht, 1.5–4.0. min_inliers=30 oder min_inliers = max(30, 0.2 * matches). cheirality_ratio_threshold=0.7.
 Weiteres: Nach Baseline implementiere ein kleines windowed BA (Ceres/g2o) über die gesammelten Posen und Inlier‑Korrespondenzen, sowie optional Loop‑Closure.
-Das ist der Implementierungsplan.

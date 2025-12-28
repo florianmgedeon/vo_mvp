@@ -108,18 +108,30 @@ static bool stage_orb_matching(const Config& cfg) {
 
     fs::create_directories(cfg.matchesDir);
 
-    // If not forcing recompute and matches already exist, skip
+    // If not forcing recompute and matches already exist (json or png), skip
     if (!cfg.force_recompute) {
-        auto existing = list_png_files_sorted(cfg.matchesDir);
-        if (!existing.empty()) {
-            std::cout << "[Stage 2] Matches already exist (" << existing.size()
-                      << "), skipping matching.\n";
+        bool any = false;
+        if (fs::exists(cfg.matchesDir)) {
+            for (auto& p : fs::directory_iterator(cfg.matchesDir)) {
+                if (!p.is_regular_file()) continue;
+                auto ext = p.path().extension().string();
+                if (ext == ".png" || ext == ".json" || ext == ".yml" || ext == ".yaml") {
+                    any = true;
+                    break;
+                }
+            }
+        }
+        if (any) {
+            std::cout << "[Stage 2] Matches already exist in " << cfg.matchesDir
+                      << ", skipping matching.\n";
             return true;
         }
     } else {
-        // wipe old match images
+        // wipe old match images and jsons
         for (auto& p : fs::directory_iterator(cfg.matchesDir)) {
-            if (p.is_regular_file() && p.path().extension() == ".png") fs::remove(p.path());
+            if (!p.is_regular_file()) continue;
+            auto ext = p.path().extension().string();
+            if (ext == ".png" || ext == ".json" || ext == ".yml" || ext == ".yaml") fs::remove(p.path());
         }
     }
 
@@ -175,15 +187,56 @@ static bool stage_orb_matching(const Config& cfg) {
                   [](const cv::DMatch& a, const cv::DMatch& b) { return a.distance < b.distance; });
         if (good.size() > 80) good.resize(80);
 
+        // draw and write match image
         cv::Mat vis;
         cv::drawMatches(img1, kp1, img2, kp2, good, vis);
 
-        std::ostringstream outName;
-        outName << cfg.matchesDir << "/match_"
-                << std::setw(5) << std::setfill('0') << i
-                << ".png";
+        std::ostringstream outNameImg;
+        outNameImg << cfg.matchesDir << "/match_"
+                   << std::setw(5) << std::setfill('0') << i
+                   << ".png";
 
-        if (cv::imwrite(outName.str(), vis)) written++;
+        if (cv::imwrite(outNameImg.str(), vis)) written++;
+
+        // Persist keypoints and matches as JSON using OpenCV FileStorage (JSON format)
+        std::ostringstream outNameJson;
+        outNameJson << cfg.matchesDir << "/match_"
+                    << std::setw(5) << std::setfill('0') << i
+                    << ".json";
+
+        try {
+            cv::FileStorage fsOut(outNameJson.str(), cv::FileStorage::WRITE | cv::FileStorage::FORMAT_JSON);
+
+            // keypoints1
+            fsOut << "keypoints1" << "[";
+            for (const auto& k : kp1) {
+                fsOut << "{:" << "x" << k.pt.x << "y" << k.pt.y << "}";
+            }
+            fsOut << "]";
+
+            // keypoints2
+            fsOut << "keypoints2" << "[";
+            for (const auto& k : kp2) {
+                fsOut << "{:" << "x" << k.pt.x << "y" << k.pt.y << "}";
+            }
+            fsOut << "]";
+
+            // matches as pairs [idx1, idx2]
+            fsOut << "matches" << "[";
+            for (const auto& m : good) {
+                fsOut << "[" << m.queryIdx << m.trainIdx << "]";
+            }
+            fsOut << "]";
+
+            // basic meta
+            fsOut << "num_keypoints1" << static_cast<int>(kp1.size());
+            fsOut << "num_keypoints2" << static_cast<int>(kp2.size());
+            fsOut << "num_matches" << static_cast<int>(good.size());
+
+            fsOut.release();
+        } catch (const std::exception& e) {
+            std::cerr << "[Stage 2] WARNING: Failed to write JSON for pair " << i << " : " << e.what() << "\n";
+        }
     }
 
     std::cout << "[Stage 2] Wrote " << written << " match images into " << cfg.matchesDir << "\n";
