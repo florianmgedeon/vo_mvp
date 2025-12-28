@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <string>
 
 #include "config.hpp"
 
@@ -243,6 +244,159 @@ static bool stage_orb_matching(const Config& cfg) {
     return (written > 0);
 }
 
+// ---------- Stage 3: Recover pose ----------
+bool stage_recover_pose(const Config &cfg) {
+    namespace fs = std::filesystem;
+    if (!fs::exists(cfg.matchesDir)) {
+        std::cerr << "matchesDir does not exist: " << cfg.matchesDir << "\n";
+        return false;
+    }
+
+    cv::Mat K = (cv::Mat_<double>(3,3) << cfg.fx, 0.0, cfg.cx,
+                                          0.0, cfg.fy, cfg.cy,
+                                          0.0, 0.0, 1.0);
+
+    int accepted_count = 0;
+    for (auto &entry : fs::directory_iterator(cfg.matchesDir)) {
+        if (!entry.is_regular_file()) continue;
+        std::string path = entry.path().string();
+        std::string name = entry.path().filename().string();
+        // expect files like match_XXXXX.yml/.json
+        if (name.find("match_") == std::string::npos) continue;
+
+        cv::FileStorage fsr(path, cv::FileStorage::READ);
+        if (!fsr.isOpened()) {
+            std::cerr << "Failed to open match file: " << path << "\n";
+            continue;
+        }
+
+        std::vector<cv::Point2f> kps1, kps2;
+        cv::Mat matchesMat;
+        fsr["keypoints1"] >> kps1;
+        fsr["keypoints2"] >> kps2;
+        fsr["matches"] >> matchesMat;
+        fsr.release();
+
+        if (kps1.empty() || kps2.empty() || matchesMat.empty()) {
+            std::cerr << "Missing data in " << path << " (will skip)\n";
+            continue;
+        }
+
+        std::vector<cv::Point2f> pts1, pts2;
+        // matchesMat expected Nx2 (ints)
+        for (int r = 0; r < matchesMat.rows; ++r) {
+            int a = 0, b = 0;
+            if (matchesMat.type() == CV_32S || matchesMat.type() == CV_32SC1) {
+                a = matchesMat.at<int>(r,0);
+                b = matchesMat.at<int>(r,1);
+            } else {
+                // fallback for float/double stored indices
+                a = static_cast<int>(matchesMat.at<double>(r,0));
+                b = static_cast<int>(matchesMat.at<double>(r,1));
+            }
+            if (a < 0 || a >= (int)kps1.size() || b < 0 || b >= (int)kps2.size()) continue;
+            pts1.push_back(kps1[a]);
+            pts2.push_back(kps2[b]);
+        }
+
+        if (pts1.size() < 8) {
+            std::cerr << name << ": not enough matched points (" << pts1.size() << ")\n";
+            continue;
+        }
+
+        // Essential matrix with RANSAC
+        cv::Mat mask;
+        cv::Mat E = cv::findEssentialMat(pts1, pts2, K, cv::RANSAC,
+                                         cfg.ransac_prob, cfg.ransac_thresh, mask);
+        if (E.empty()) {
+            std::cerr << name << ": findEssentialMat failed\n";
+            continue;
+        }
+
+        cv::Mat R, t;
+        int inliers = cv::recoverPose(E, pts1, pts2, K, R, t, mask);
+        if (inliers <= 0) {
+            std::cerr << name << ": recoverPose yielded zero inliers\n";
+            continue;
+        }
+
+        // collect inlier points for cheirality test
+        std::vector<cv::Point2f> in1, in2;
+        std::vector<int> inlierIdx;
+        for (size_t i = 0; i < mask.rows && i < pts1.size(); ++i) {
+            if (mask.at<unsigned char>(i,0)) {
+                in1.push_back(pts1[i]);
+                in2.push_back(pts2[i]);
+                inlierIdx.push_back((int)i);
+            }
+        }
+
+        if ((int)in1.size() < cfg.min_inliers) {
+            std::cerr << name << ": too few inliers after RANSAC: " << in1.size() << "\n";
+            continue;
+        }
+
+        // Triangulate and check cheirality
+        cv::Mat P0 = cv::Mat::zeros(3,4,CV_64F);
+        P0.at<double>(0,0) = 1.0; P0.at<double>(1,1) = 1.0; P0.at<double>(2,2) = 1.0;
+        cv::Mat P1 = cv::Mat::zeros(3,4,CV_64F);
+        cv::Mat R64, t64;
+        R.convertTo(R64, CV_64F);
+        t.convertTo(t64, CV_64F);
+        R64.copyTo(P1.colRange(0,3));
+        t64.copyTo(P1.col(3));
+
+        // convert to camera coordinates: K * [R|t]
+        cv::Mat KP0 = K * P0;
+        cv::Mat KP1 = K * P1;
+
+        cv::Mat points4d;
+        cv::triangulatePoints(KP0, KP1, in1, in2, points4d);
+
+        int positive_depth_count = 0;
+        for (int c = 0; c < points4d.cols; ++c) {
+            cv::Mat col = points4d.col(c);
+            col /= col.at<double>(3,0); // make non-homogeneous
+            cv::Mat X = col.rowRange(0,3); // 3x1
+            double z1 = X.at<double>(2,0);
+            cv::Mat Xc2 = R64 * X + t64;
+            double z2 = Xc2.at<double>(2,0);
+            if (z1 > 0 && z2 > 0) ++positive_depth_count;
+        }
+        double cheirality_ratio = double(positive_depth_count) / double(points4d.cols);
+
+        if (cheirality_ratio < 0.7) {
+            std::cerr << name << ": bad cheirality ratio " << cheirality_ratio << "\n";
+            continue;
+        }
+
+        // Accept pose -> save
+        std::string pose_name = name;
+        // replace "match" with "pose"
+        size_t pos = pose_name.find("match");
+        if (pos != std::string::npos) pose_name.replace(pos, 5, "pose");
+        std::string outpath = (fs::path(cfg.matchesDir) / pose_name).string();
+
+        cv::FileStorage wfs(outpath, cv::FileStorage::WRITE);
+        wfs << "R" << R;
+        wfs << "t" << t;
+        wfs << "num_inliers" << (int)in1.size();
+        wfs << "cheirality_ratio" << cheirality_ratio;
+        // write inlier mask as vector<int>
+        std::vector<int> mask_vec(mask.rows);
+        for (int i = 0; i < mask.rows; ++i) mask_vec[i] = mask.at<unsigned char>(i,0) ? 1 : 0;
+        wfs << "inliers_mask" << mask_vec;
+        wfs.release();
+
+        ++accepted_count;
+        std::cout << name << ": accepted pose saved to " << outpath
+                  << " (inliers=" << in1.size() << ", cheirality=" << cheirality_ratio << ")\n";
+    }
+
+    std::cout << "stage_recover_pose: accepted poses = " << accepted_count << "\n";
+    return true;
+}
+
 // ---------- main orchestrator ----------
 int main() {
     Config cfg; // loads defaults from config.hpp
@@ -253,6 +407,7 @@ int main() {
 
     if (!stage_extract_frames(cfg)) return 1;
     if (!stage_orb_matching(cfg)) return 1;
+    if (!stage_recover_pose(cfg)) return 1;
 
     std::cout << "[OK] Pipeline finished.\n";
     return 0;
